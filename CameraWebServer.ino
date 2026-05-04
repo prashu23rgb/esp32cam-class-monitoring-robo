@@ -3,43 +3,110 @@
 #include "esp32-hal-ledc.h"
 #include <Wire.h>
 #include <PCF8574.h>
+#include <DFRobotDFPlayerMini.h>
 
-// WiFi credential for network
+// wifi 
 const char* ssid = "Motopri";
 const char* password = "17340001";
 
-// Sensor Pins declare here 
-#define IR_PIN 2
-#define SOUND_PIN 13 
+// sensor state declare 
+int ir_state = 1;
+int sound_state = 1;
 
-int lastIR = 1;
-int lastSound = 1;
-
-// --- NON-BLOCKING TIMING VARIABLES ---
-unsigned long obstacleStartTime = 0;
-const unsigned long backwardDuration = 400; // Move back for 800ms
-bool isBackingUp = false;
-
-unsigned long lastSensorReadTime = 0;
-const int sensorPollInterval = 25; // Read sensors every 50ms
-
-// PCF8574
+// pcf
 PCF8574 pcf8574(0x20);
 bool pcf_ok = false;
 
-// Motor mapping
 #define IN1 0
 #define IN2 1
 #define IN3 2
 #define IN4 3
 
-// Camera pins (ESP32-CAM AI-Thinker)
+#define IR_PIN 4
+#define SOUND_PIN 5
+
+//  DF PLAYER 
+HardwareSerial dfSerial(1);
+DFRobotDFPlayerMini dfPlayer;
+
+
+bool isAudioPlaying = false;
+unsigned long audioStartTime = 0;
+const int audioDuration = 1500;
+
+void playSound(int id) {
+  if (isAudioPlaying) return;
+  dfPlayer.play(id);
+  isAudioPlaying = true;
+  audioStartTime = millis();
+}
+
+// motor cmd 
+int currentCommand = 0;
+unsigned long commandStartTime = 0;
+const int commandDuration = 200;
+
+void executeMotor(int cmd) {
+  if (!pcf_ok) return;
+
+  switch (cmd) {
+    case 1:
+      pcf8574.write(IN1, HIGH); pcf8574.write(IN2, LOW);
+      pcf8574.write(IN3, HIGH); pcf8574.write(IN4, LOW);
+      playSound(5);
+      break;
+
+    case 2:
+      pcf8574.write(IN1, LOW); pcf8574.write(IN2, HIGH);
+      pcf8574.write(IN3, LOW); pcf8574.write(IN4, HIGH);
+      playSound(6);
+      break;
+
+    case 3:
+      pcf8574.write(IN1, HIGH); pcf8574.write(IN2, LOW);
+      pcf8574.write(IN3, LOW); pcf8574.write(IN4, LOW);
+      playSound(7);
+      break;
+
+    case 4:
+      pcf8574.write(IN1, LOW); pcf8574.write(IN2, LOW);
+      pcf8574.write(IN3, HIGH); pcf8574.write(IN4, LOW);
+      playSound(8);
+      break;
+  }
+}
+
+void stopMotor() {
+  if (!pcf_ok) return;
+  pcf8574.write(IN1, LOW);
+  pcf8574.write(IN2, LOW);
+  pcf8574.write(IN3, LOW);
+  pcf8574.write(IN4, LOW);
+}
+
+void triggerCommand(int cmd) {
+  currentCommand = cmd;
+  commandStartTime = millis();
+  executeMotor(cmd);
+}
+
+// ---------------- SENSOR ----------------
+unsigned long lastSensorReadTime = 0;
+const int sensorPollInterval = 25;
+
+unsigned long irStart = 0;
+bool obstacleHandled = false;
+
+bool isBackingUp = false;
+unsigned long obstacleStartTime = 0;
+const int backwardDuration = 400;
+
+// ---------------- CAMERA ----------------
 #define PWDN_GPIO_NUM  32
 #define RESET_GPIO_NUM -1
 #define XCLK_GPIO_NUM  0
 #define SIOD_GPIO_NUM  26
 #define SIOC_GPIO_NUM  27
-#define LED_GPIO_NUM   4
 #define Y9_GPIO_NUM    35
 #define Y8_GPIO_NUM    34
 #define Y7_GPIO_NUM    39
@@ -54,40 +121,32 @@ bool pcf_ok = false;
 
 void startCameraServer();
 
-// ===== MOTOR CONTROL function created by us  =====
-void forward() { 
-  if(pcf_ok){ pcf8574.write(IN1, HIGH); pcf8574.write(IN2, LOW); pcf8574.write(IN3, HIGH); pcf8574.write(IN4, LOW); } }
-void backward() {
-   if(pcf_ok){ pcf8574.write(IN1, LOW); pcf8574.write(IN2, HIGH); pcf8574.write(IN3, LOW); pcf8574.write(IN4, HIGH); } }
-void stopMotor() { 
-  if(pcf_ok){ pcf8574.write(IN1, LOW); pcf8574.write(IN2, LOW); pcf8574.write(IN3, LOW); pcf8574.write(IN4, LOW); } }
-void left() {
-  if(pcf_ok){
-    pcf8574.write(IN1, LOW);
-    pcf8574.write(IN2, LOW);
-    pcf8574.write(IN3, HIGH);
-    pcf8574.write(IN4, LOW);
-  }
-}
-
-void right() {
-  if(pcf_ok){
-    pcf8574.write(IN1, HIGH);
-    pcf8574.write(IN2, LOW);
-    pcf8574.write(IN3, LOW);
-    pcf8574.write(IN4, LOW);
-  }
-}
+// ---------------- SETUP ----------------
 void setup() {
   Serial.begin(115200);
-  Wire.begin(14, 15); 
+
+  Wire.begin(14, 15);
   pcf_ok = pcf8574.begin();
-  if (pcf_ok) stopMotor();
 
-  pinMode(IR_PIN, INPUT);
-  pinMode(SOUND_PIN, INPUT);
+  if (pcf_ok) {
+    stopMotor();
+    pcf8574.write(IR_PIN, HIGH);
+    pcf8574.write(SOUND_PIN, HIGH);
+  }
 
-  // CAMERA CONFIG (Fixed for Stream Stability) ( copied from example code )
+  // DFPlayer
+  dfSerial.begin(9600, SERIAL_8N1, 13, 2);
+
+  if (dfPlayer.begin(dfSerial)) {
+    Serial.println("DF OK");
+    delay(1500);
+    dfPlayer.volume(25);
+    dfPlayer.play(1);
+  } else {
+    Serial.println("DF FAIL");
+  }
+
+  // CAMERA CONFIG
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -107,69 +166,87 @@ void setup() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 15000000; // Stable XCLK
+  config.xclk_freq_hz = 15000000;
   config.frame_size = FRAMESIZE_QVGA;
   config.pixel_format = PIXFORMAT_JPEG;
   config.jpeg_quality = 15;
-  config.fb_count = 2;
-  if (psramFound()) {
-    config.fb_count = 4;
-  }
+  config.fb_count = psramFound() ? 4 : 2;
 
   if (esp_camera_init(&config) != ESP_OK) return;
 
   WiFi.begin(ssid, password);
-  WiFi.setSleep(false);
-  while (WiFi.status() != WL_CONNECTED) { delay(500); }
 
-  startCameraServer();
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 10000) {
+    delay(300);
+  }
 
-  Serial.print("📡 Stream: http://");
-  Serial.println(WiFi.localIP());
-  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(WiFi.localIP());
+  }
+
   startCameraServer();
 }
 
+// ---------------- LOOP ----------------
 void loop() {
-  // 1. joystick to handle motor state 
-  extern void handleMotorState();
-  
-  // Only handle manual command 
-  if (!isBackingUp) {
-    handleMotorState();
+
+  extern int robotState;
+
+  //cmd
+  if (robotState != 0 && !isBackingUp) {
+    triggerCommand(robotState);
+    robotState = 0;
   }
 
-  // 2. Sensor Polling (Non-blocking Interval)
+  // auto stop 
+  if (currentCommand != 0 && millis() - commandStartTime > commandDuration) {
+    stopMotor();
+    currentCommand = 0;
+  }
+
+  // audio reset 
+  if (isAudioPlaying && millis() - audioStartTime > audioDuration) {
+    isAudioPlaying = false;
+  }
+
+  // polling 
   if (millis() - lastSensorReadTime > sensorPollInterval) {
-    int ir = digitalRead(IR_PIN);
-    int sound = digitalRead(SOUND_PIN);
 
-    // --- IR OBSTACLE DETECTION ---
-    if (ir == 0 && lastIR == 1 && !isBackingUp) {
-     
-      isBackingUp = true;
-      obstacleStartTime = millis();
-      backward(); // Start backward movement
+    int ir = pcf8574.read(IR_PIN);
+    int sound = pcf8574.read(SOUND_PIN);
+
+    // update shared state (THIS WAS MISSING)
+    ir_state = ir;
+    sound_state = sound;
+
+    // IR obstacle logic
+    if (ir == 0) {
+      if (!obstacleHandled) {
+
+        if (irStart == 0) irStart = millis();
+
+        if (millis() - irStart > 100) {
+          isBackingUp = true;
+          obstacleStartTime = millis();
+
+          triggerCommand(2);
+          playSound(2);
+
+          obstacleHandled = true;
+        }
+      }
+    } else {
+      irStart = 0;
+      obstacleHandled = false;
     }
 
-    // --- SOUND DETECTION ---
-    if (sound == 0 && lastSound == 1) {
-     
-    }
-
-    lastIR = ir;
-    lastSound = sound;
     lastSensorReadTime = millis();
   }
 
-  // Automatic Backup Timer (Non-blocking)
-  if (isBackingUp) {
-    if (millis() - obstacleStartTime > backwardDuration) {
-      stopMotor();
-      isBackingUp = false;
-      
-    }
+  //  BACKWARD STOP
+  if (isBackingUp && millis() - obstacleStartTime > backwardDuration) {
+    stopMotor();
+    isBackingUp = false;
   }
-
-  delay(1); 
 }

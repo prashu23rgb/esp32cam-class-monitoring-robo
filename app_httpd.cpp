@@ -6,14 +6,22 @@
 #include "esp32-hal-ledc.h"
 #include "sdkconfig.h"
 #include "Arduino.h" 
+#include <PCF8574.h>
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
 #endif
 
-// Pins for status reading
-#define IR_PIN 2
-#define SOUND_PIN 13
+extern PCF8574 pcf8574;
+extern bool pcf_ok;
+
+// 🔥 ADD THIS (shared state from .ino)
+extern int ir_state;
+extern int sound_state;
+
+// Sensor mapping (PCF pins)
+#define IR_PIN 4
+#define SOUND_PIN 5
 
 // --- EXTERNAL MOTOR FUNCTIONS ---
 extern void forward();
@@ -139,15 +147,17 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
     return httpd_resp_send(req, NULL, 0);
 }
 
+// 🔥 FIXED SENSOR HANDLER (ONLY CHANGE)
 static esp_err_t status_handler(httpd_req_t *req) {
-    static char json_response[256];
-    int ir_val = digitalRead(IR_PIN);
-    int sound_val = digitalRead(SOUND_PIN);
-    sprintf(json_response, "{\"ir\":%d,\"sound\":%d}", ir_val, sound_val);
+    static char json_response[150];
+
+    sprintf(json_response, "{\"ir\":%d,\"sound\":%d}", ir_state, sound_state);
+
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     return httpd_resp_send(req, json_response, strlen(json_response));
 }
+
 
 static esp_err_t index_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html");
@@ -157,7 +167,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
 "<script src='https://cdnjs.cloudflare.com/ajax/libs/nipplejs/0.9.0/nipplejs.min.js'></script>"
 "<style>"
 "body{font-family:sans-serif;background:#121212;color:#fff;margin:0;display:flex;flex-direction:column;height:100vh;overflow:hidden}"
-".header{background:#00bcd4;width:100%;padding:12px 0;text-align:center;box-shadow:0 2px 10px rgba(0,0,0,0.5);font-weight:bold;text-transform:uppercase;z-index:10}"
+".header{background:#00bcd4;width:100%;padding:12px 0;text-align:center;box-shadow:0 2px 20px rgba(0,0,0,0.5);font-weight:bold;text-transform:uppercase;z-index:10}"
 ".status-bar{background:#333;padding:5px;font-size:10px;text-align:center;color:#00bcd4;border-bottom:1px solid #444;display:flex;justify-content:space-around}"
 ".main-layout{display:flex;flex:1;width:100%;overflow:hidden;position:relative}"
 ".side-panel{width:340px;background:#1e1e1e;padding:15px;display:flex;flex-direction:column;gap:12px;border-right:1px solid #333;box-sizing:border-box;overflow-y:auto}"
