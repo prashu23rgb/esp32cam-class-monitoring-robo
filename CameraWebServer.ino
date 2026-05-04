@@ -47,14 +47,14 @@ void backward() {
 
 void left() {
   if (!pcf_ok) return;
-  pcf8574.write(IN1, HIGH); pcf8574.write(IN2, LOW);
-  pcf8574.write(IN3, LOW); pcf8574.write(IN4, LOW);
+  pcf8574.write(IN1, LOW); pcf8574.write(IN2, LOW);
+  pcf8574.write(IN3, HIGH); pcf8574.write(IN4, LOW);
 }
 
 void right() {
   if (!pcf_ok) return;
-  pcf8574.write(IN1, LOW); pcf8574.write(IN2, LOW);
-  pcf8574.write(IN3, HIGH); pcf8574.write(IN4, LOW);
+  pcf8574.write(IN1, HIGH); pcf8574.write(IN2, LOW);
+  pcf8574.write(IN3, LOW); pcf8574.write(IN4, LOW);
 }
 
 void stopMotor() {
@@ -78,8 +78,13 @@ unsigned long lastSensorReadTime = 0;
 const int sensorPollInterval = 100;
 
 bool was_ir_blocked = false;
+bool was_sound_detected = false;
+unsigned long ir_block_start = 0;
+unsigned long sound_block_start = 0;
 bool is_backing_up = false;
-unsigned long backup_start_time = 0;
+int backup_state = 0;
+unsigned long backup_timer = 0;
+const int audio2_duration = 2500; // IMPORTANT: Set this to the exact length of 0002.mp3 in ms
 const int backup_duration = 500;
 
 // ---------------- CAMERA ----------------
@@ -119,7 +124,9 @@ void setup() {
 
   if (dfPlayer.begin(dfSerial, /*isACK*/ false, /*doReset*/ true)) {
     Serial.println("DFPlayer Mini online.");
+    delay(2000); // Give the DFPlayer time to mount the SD card after resetting
     dfPlayer.volume(25);
+    delay(100);
     dfPlayer.playMp3Folder(1); // Play startup sound mp3/0001.mp3
   } else {
     Serial.println("DFPlayer Mini failed to start.");
@@ -171,12 +178,24 @@ void setup() {
 // ---------------- LOOP ----------------
 void loop() {
   // Let the web server handle motor commands and timeouts
-  handleMotorState();
+  if (!is_backing_up) {
+    handleMotorState();
+  }
 
-  // Handle autonomous backup state
-  if (is_backing_up && millis() - backup_start_time > backup_duration) {
-    stopMotor();
-    is_backing_up = false;
+  // Handle autonomous backup state machine without blocking delays!
+  if (is_backing_up) {
+    if (backup_state == 1 && millis() - backup_timer > audio2_duration) {
+      // Step 1 complete (Audio 2 finished). Start Step 2: Audio 6 + Move Backward
+      dfPlayer.playMp3Folder(6);
+      backward();
+      backup_state = 2;
+      backup_timer = millis();
+    } else if (backup_state == 2 && millis() - backup_timer > backup_duration) {
+      // Step 2 complete (Backup movement finished). Stop and return to normal.
+      stopMotor();
+      is_backing_up = false;
+      backup_state = 0;
+    }
   }
 
   // Poll sensors periodically
@@ -185,31 +204,43 @@ void loop() {
 
     if (!pcf_ok) return;
 
-    ir_state = pcf8574.read(IR_PIN);
-    sound_state = pcf8574.read(SOUND_PIN);
+    int raw_ir = pcf8574.read(IR_PIN);
+    int raw_sound = pcf8574.read(SOUND_PIN);
 
-    // IR Obstacle Logic: Trigger only on the transition from clear to blocked
-    if (ir_state == 0 && !was_ir_blocked && !is_backing_up) {
-      was_ir_blocked = true; // Mark as blocked to prevent re-triggering
-      is_backing_up = true;   // Enter backup state
-      backup_start_time = millis();
+    // IR Obstacle Logic: Trigger only if blocked continuously for > 500ms
+    if (raw_ir == 0) {
+      if (ir_block_start == 0) ir_block_start = millis(); // Start timing
+      if (millis() - ir_block_start > 500 && !was_ir_blocked && !is_backing_up) {
+        was_ir_blocked = true; // Mark as blocked to prevent re-triggering
+        ir_state = 0;          // Expose blocked state to web UI
+        is_backing_up = true;
+        backup_state = 1;
+        backup_timer = millis();
 
-      Serial.println("Obstacle detected! Initiating backup sequence.");
-      
-      stopMotor(); // Stop current movement immediately
-      
-      // Play sequence: 0002.mp3 -> delay -> 0006.mp3
-      dfPlayer.playMp3Folder(2);
-      // IMPORTANT: Adjust this delay to match the length of your 0002.mp3 file in milliseconds.
-      // A better method is to use the BUSY pin of the DFPlayer to know when a track is finished.
-      delay(1500); 
-      
-      dfPlayer.playMp3Folder(6);
-      
-      // Start moving backward
-      backward();
-    } else if (ir_state != 0) {
-      was_ir_blocked = false; // Path is clear, reset the flag
+        Serial.println("Obstacle detected! Initiating backup sequence.");
+        
+        stopMotor(); // Stop current movement immediately
+        dfPlayer.playMp3Folder(2); // Start Step 1: Play Audio 2
+      }
+    } else {
+      ir_block_start = 0;      // Reset timer
+      was_ir_blocked = false;  // Path is clear
+      ir_state = 1;            // Expose clear state to web UI
+    }
+
+    // Sound Sensor Logic: Trigger only if noise detected continuously for > 3000ms
+    if (raw_sound == 0) {
+      if (sound_block_start == 0) sound_block_start = millis(); // Start timing
+      if (millis() - sound_block_start > 3000 && !was_sound_detected && !is_backing_up) {
+        was_sound_detected = true;
+        sound_state = 0;       // Expose noise state to web UI
+        Serial.println("Noise detected! Playing audio 3.");
+        dfPlayer.playMp3Folder(3);
+      }
+    } else {
+      sound_block_start = 0;       // Reset timer
+      was_sound_detected = false;  // Reset detection
+      sound_state = 1;             // Expose quiet state to web UI
     }
   }
 }
