@@ -1,6 +1,5 @@
 #include "esp_camera.h"
 #include <WiFi.h>
-#include "esp32-hal-ledc.h"
 #include <Wire.h>
 #include <PCF8574.h>
 #include <DFRobotDFPlayerMini.h>
@@ -9,11 +8,11 @@
 const char* ssid = "Motopri";
 const char* password = "17340001";
 
-// sensor state declare 
+// Shared state for app_httpd.cpp
 int ir_state = 1;
 int sound_state = 1;
 
-// pcf
+// PCF8574 I/O Expander
 PCF8574 pcf8574(0x20);
 bool pcf_ok = false;
 
@@ -25,81 +24,63 @@ bool pcf_ok = false;
 #define IR_PIN 4
 #define SOUND_PIN 5
 
-//  DF PLAYER 
+// DFPlayer Mini
 HardwareSerial dfSerial(1);
 DFRobotDFPlayerMini dfPlayer;
 
+// Forward declarations for functions used by app_httpd.cpp
+void startCameraServer();
+extern void handleMotorState();
 
-bool isAudioPlaying = false;
-unsigned long audioStartTime = 0;
-const int audioDuration = 1500;
-
-void playSound(int id) {
-  if (isAudioPlaying) return;
-  dfPlayer.play(id);
-  isAudioPlaying = true;
-  audioStartTime = millis();
+// --- MOTOR CONTROL FUNCTIONS (called by app_httpd.cpp) ---
+void forward() {
+  if (!pcf_ok) return;
+  pcf8574.write(IN1, HIGH); pcf8574.write(IN2, LOW);
+  pcf8574.write(IN3, HIGH); pcf8574.write(IN4, LOW);
 }
 
-// motor cmd 
-int currentCommand = 0;
-unsigned long commandStartTime = 0;
-const int commandDuration = 200;
-
-void executeMotor(int cmd) {
+void backward() {
   if (!pcf_ok) return;
+  pcf8574.write(IN1, LOW); pcf8574.write(IN2, HIGH);
+  pcf8574.write(IN3, LOW); pcf8574.write(IN4, HIGH);
+}
 
-  switch (cmd) {
-    case 1:
-      pcf8574.write(IN1, HIGH); pcf8574.write(IN2, LOW);
-      pcf8574.write(IN3, HIGH); pcf8574.write(IN4, LOW);
-      playSound(5);
-      break;
+void left() {
+  if (!pcf_ok) return;
+  pcf8574.write(IN1, HIGH); pcf8574.write(IN2, LOW);
+  pcf8574.write(IN3, LOW); pcf8574.write(IN4, LOW);
+}
 
-    case 2:
-      pcf8574.write(IN1, LOW); pcf8574.write(IN2, HIGH);
-      pcf8574.write(IN3, LOW); pcf8574.write(IN4, HIGH);
-      playSound(6);
-      break;
-
-    case 3:
-      pcf8574.write(IN1, HIGH); pcf8574.write(IN2, LOW);
-      pcf8574.write(IN3, LOW); pcf8574.write(IN4, LOW);
-      playSound(7);
-      break;
-
-    case 4:
-      pcf8574.write(IN1, LOW); pcf8574.write(IN2, LOW);
-      pcf8574.write(IN3, HIGH); pcf8574.write(IN4, LOW);
-      playSound(8);
-      break;
-  }
+void right() {
+  if (!pcf_ok) return;
+  pcf8574.write(IN1, LOW); pcf8574.write(IN2, LOW);
+  pcf8574.write(IN3, HIGH); pcf8574.write(IN4, LOW);
 }
 
 void stopMotor() {
   if (!pcf_ok) return;
-  pcf8574.write(IN1, LOW);
-  pcf8574.write(IN2, LOW);
-  pcf8574.write(IN3, LOW);
-  pcf8574.write(IN4, LOW);
+  pcf8574.write(IN1, LOW); pcf8574.write(IN2, LOW);
+  pcf8574.write(IN3, LOW); pcf8574.write(IN4, LOW);
 }
 
-void triggerCommand(int cmd) {
-  currentCommand = cmd;
-  commandStartTime = millis();
-  executeMotor(cmd);
+// --- AUDIO CONTROL FUNCTION (called by app_httpd.cpp) ---
+void playMovementSound(int state) {
+  switch (state) {
+    case 1: dfPlayer.playMp3Folder(5); break; // Forward -> mp3/0005.mp3
+    case 2: dfPlayer.playMp3Folder(6); break; // Backward -> mp3/0006.mp3
+    case 3: dfPlayer.playMp3Folder(7); break; // Left -> mp3/0007.mp3
+    case 4: dfPlayer.playMp3Folder(8); break; // Right -> mp3/0008.mp3
+  }
 }
 
-// ---------------- SENSOR ----------------
+// --- SENSOR & AUTONOMY GLOBALS ---
 unsigned long lastSensorReadTime = 0;
-const int sensorPollInterval = 25;
+const int sensorPollInterval = 100;
 
-unsigned long irStart = 0;
-bool obstacleHandled = false;
-
-bool isBackingUp = false;
-unsigned long obstacleStartTime = 0;
-const int backwardDuration = 400;
+bool was_ir_blocked = false;
+bool is_backing_up = false;
+unsigned long backup_start_time = 0;
+const int backup_duration = 500;
 
 // ---------------- CAMERA ----------------
 #define PWDN_GPIO_NUM  32
@@ -119,8 +100,6 @@ const int backwardDuration = 400;
 #define HREF_GPIO_NUM  23
 #define PCLK_GPIO_NUM  22
 
-void startCameraServer();
-
 // ---------------- SETUP ----------------
 void setup() {
   Serial.begin(115200);
@@ -130,20 +109,20 @@ void setup() {
 
   if (pcf_ok) {
     stopMotor();
+    // For PCF8574, writing HIGH to a pin sets it to high-impedance (input mode)
     pcf8574.write(IR_PIN, HIGH);
     pcf8574.write(SOUND_PIN, HIGH);
   }
 
-  // DFPlayer
+  // DFPlayer Mini
   dfSerial.begin(9600, SERIAL_8N1, 13, 2);
 
-  if (dfPlayer.begin(dfSerial)) {
-    Serial.println("DF OK");
-    delay(1500);
+  if (dfPlayer.begin(dfSerial, /*isACK*/ false, /*doReset*/ true)) {
+    Serial.println("DFPlayer Mini online.");
     dfPlayer.volume(25);
-    dfPlayer.play(1);
+    dfPlayer.playMp3Folder(1); // Play startup sound mp3/0001.mp3
   } else {
-    Serial.println("DF FAIL");
+    Serial.println("DFPlayer Mini failed to start.");
   }
 
   // CAMERA CONFIG
@@ -186,67 +165,51 @@ void setup() {
   }
 
   startCameraServer();
+  Serial.println("Robot ready.");
 }
 
 // ---------------- LOOP ----------------
 void loop() {
+  // Let the web server handle motor commands and timeouts
+  handleMotorState();
 
-  extern int robotState;
-
-  //cmd
-  if (robotState != 0 && !isBackingUp) {
-    triggerCommand(robotState);
-    robotState = 0;
-  }
-
-  // auto stop 
-  if (currentCommand != 0 && millis() - commandStartTime > commandDuration) {
+  // Handle autonomous backup state
+  if (is_backing_up && millis() - backup_start_time > backup_duration) {
     stopMotor();
-    currentCommand = 0;
+    is_backing_up = false;
   }
 
-  // audio reset 
-  if (isAudioPlaying && millis() - audioStartTime > audioDuration) {
-    isAudioPlaying = false;
-  }
-
-  // polling 
+  // Poll sensors periodically
   if (millis() - lastSensorReadTime > sensorPollInterval) {
-
-    int ir = pcf8574.read(IR_PIN);
-    int sound = pcf8574.read(SOUND_PIN);
-
-    // update shared state (THIS WAS MISSING)
-    ir_state = ir;
-    sound_state = sound;
-
-    // IR obstacle logic
-    if (ir == 0) {
-      if (!obstacleHandled) {
-
-        if (irStart == 0) irStart = millis();
-
-        if (millis() - irStart > 100) {
-          isBackingUp = true;
-          obstacleStartTime = millis();
-
-          triggerCommand(2);
-          playSound(2);
-
-          obstacleHandled = true;
-        }
-      }
-    } else {
-      irStart = 0;
-      obstacleHandled = false;
-    }
-
     lastSensorReadTime = millis();
-  }
 
-  //  BACKWARD STOP
-  if (isBackingUp && millis() - obstacleStartTime > backwardDuration) {
-    stopMotor();
-    isBackingUp = false;
+    if (!pcf_ok) return;
+
+    ir_state = pcf8574.read(IR_PIN);
+    sound_state = pcf8574.read(SOUND_PIN);
+
+    // IR Obstacle Logic: Trigger only on the transition from clear to blocked
+    if (ir_state == 0 && !was_ir_blocked && !is_backing_up) {
+      was_ir_blocked = true; // Mark as blocked to prevent re-triggering
+      is_backing_up = true;   // Enter backup state
+      backup_start_time = millis();
+
+      Serial.println("Obstacle detected! Initiating backup sequence.");
+      
+      stopMotor(); // Stop current movement immediately
+      
+      // Play sequence: 0002.mp3 -> delay -> 0006.mp3
+      dfPlayer.playMp3Folder(2);
+      // IMPORTANT: Adjust this delay to match the length of your 0002.mp3 file in milliseconds.
+      // A better method is to use the BUSY pin of the DFPlayer to know when a track is finished.
+      delay(1500); 
+      
+      dfPlayer.playMp3Folder(6);
+      
+      // Start moving backward
+      backward();
+    } else if (ir_state != 0) {
+      was_ir_blocked = false; // Path is clear, reset the flag
+    }
   }
 }

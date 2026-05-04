@@ -30,6 +30,9 @@ extern void left();
 extern void right();
 extern void stopMotor();
 
+// --- EXTERNAL AUDIO FUNCTION ---
+extern void playMovementSound(int state);
+
 // --- STATE MACHINE GLOBALS ---
 unsigned long lastCmdTime = 0;
 int robotState = 0; 
@@ -130,7 +133,14 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
     int val = atoi(value);
     sensor_t *s = esp_camera_sensor_get();
     int res = 0;
-    if (!strcmp(variable, "go")) { robotState = val; lastCmdTime = millis(); } 
+    if (!strcmp(variable, "go")) {
+        // Play the sound only once when the direction changes
+        if (robotState != val && val != 0) { // Don't play sound when stopping
+            playMovementSound(val);
+        }
+        robotState = val; 
+        lastCmdTime = millis(); 
+    }
     else if (!strcmp(variable, "framesize")) { if (s->pixformat == PIXFORMAT_JPEG) res = s->set_framesize(s, (framesize_t)val); }
     else if (!strcmp(variable, "quality")) res = s->set_quality(s, val);
     else if (!strcmp(variable, "contrast")) res = s->set_contrast(s, val);
